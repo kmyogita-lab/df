@@ -1,322 +1,220 @@
-# Metrics & RUM APIs – Hreflang / Market Mapping Contract
+# Routing Architecture Improvements - Implementation Summary
 
-This document describes the API contract for the metrics and RUM endpoints that now support hreflang-style locale codes. 
+## Overview
+Successfully implemented an improved routing architecture with route-level protection, code splitting, and better organization.
 
-All examples assume a local backend running at `http://localhost:4000`.
+## Changes Made
 
----
+### 1. Enhanced AuthProvider (`src/contexts/AuthProvider.jsx`)
+**What Changed:**
+- Added `profileLoading`, `isAdmin`, and `onboardingComplete` state
+- Moved admin status checking logic from Dashboard.jsx to AuthProvider
+- Now checks both Firebase Auth claims and Firestore profile for admin status
+- Automatically fetches onboarding status on authentication
 
-## 1. Shared Concepts
+**Benefits:**
+- Centralized authentication state
+- No need to duplicate admin checking logic
+- Available globally via `useAuth()` hook
 
-### 1.1. Base URLs
+### 2. Created Route Guard Components (`src/components/guards/`)
 
-- Technical SEO (static + Firestore):
-  - `/api/metrics/technical-seo`
-  - `/api/metrics/technical-seo/trends`
-- RUM / CWV metrics:
-  - `/api/firebase/rum-metrics-p75-multiple`
-  - `/api/firebase/linechart-metrics`
+#### `RequireAuth.jsx`
+- Ensures user is authenticated
+- Checks email verification (if enabled)
+- Redirects to login or verify-email as needed
 
-### 1.2. Hreflang → Market Mapping
+#### `RequireOnboarding.jsx`
+- Enforces admin onboarding flow when `VITE_ENABLE_ADMIN_ONBOARDING=true`
+- `inverse=false`: Requires onboarding to be complete (for regular routes)
+- `inverse=true`: Only accessible if onboarding is NOT complete (for onboarding page)
 
-The backend uses `mapHreflangToMarket(input)` (`src/utils/hreflangMapper.js`) to normalize incoming `market` query values into an internal *market slug* that determines the Firestore path (e.g. `technical_seo_trends/{brand}/{market}/...`).
+#### `RequireRole.jsx`
+- Checks if user has required role (admin/user)
+- Redirects non-admin users away from admin-only routes
 
-The mapper accepts both hreflang codes and some legacy market strings. It tries, in order:
+### 3. Created ErrorBoundary (`src/components/ErrorBoundary.jsx`)
+- Catches route-level errors
+- Prevents app crashes
+- Redirects to dashboard on error
 
-1. The full, lowercased input (e.g. `"en-us-stl"`).
-2. The first two segments joined (e.g. `"en-us"` from `"en-us-stl"`).
-3. The last segment (e.g. `"stl"` from `"en-us-stl"`).
+### 4. Route Configuration Files (`src/routes/`)
 
-If any of those candidates match `MARKET_MAP`, that mapped value is used as the normalized market.
+#### `auth.routes.jsx`
+- Centralized authentication routes (login, signup, verify-email, etc.)
+- Uses lazy loading for code splitting
+- Marks routes as public or protected
 
-#### 1.2.1. Supported mappings
+#### `dashboard.routes.jsx`
+- All dashboard routes with metadata
+- Includes icons, labels, paths, and components
+- Specifies `requiresAdmin` and `requiresOnboarding` flags
+- Exports `DASHBOARD_ROUTE_GROUPS` for sidebar navigation
 
-| Input(s)                            | Normalized market slug |
-| ----------------------------------- | ---------------------- |
-| `en-ca`, `canada`                  | `canada`               |
-| `tr-tr`, `turkey`                  | `turkey`               |
-| `ja-jp`, `japan`                   | `japan`                |
-| `en-us`, `usa`                     | `usa`                  |
-| `en-us-stl`, `stl`                 | `stl`                  |
-| `ar`, `ar-ae`, `mena`, `mena-arabic` | `mena`               |
-| `en-ae`, `uae`                     | `uae`                  |
-| `en-gb`, `en-uk`, `uk`, `united-kingdom` | `united-kingdom` |
-| `en-in`, `india`                   | `india`                |
+#### `index.js`
+- Central export point for all route configurations
 
-If no mapping exists, the backend treats the market as **unsupported**.
+### 5. Updated MainLayout (`src/components/layout/MainLayout.jsx`)
+**What Changed:**
+- Now uses `<Outlet />` for nested routes
+- Includes sidebar with navigation
+- Filters navigation based on admin status
+- No longer accepts `children` prop
 
-#### 1.2.2. Mapper result shape
+**Benefits:**
+- Consistent layout across all dashboard routes
+- Sidebar automatically updates based on user role
+- Better separation of concerns
 
-The internal helper returns one of:
+### 6. Refactored App.jsx
+**What Changed:**
+- Removed all hardcoded route definitions
+- Uses route configuration from `routes/` directory
+- Implements lazy loading with `<Suspense>`
+- Uses dedicated guard components for protection
+- Nested dashboard routes under `/dashboard`
 
-- Success: `{ market: "<normalized_slug>", matchedKey: "<key_used>" }`
-- Error (empty input): `{ error: "MARKET_REQUIRED" }`
-- Error (no rule): `{ error: "UNSUPPORTED_MARKET:<original_input>" }`
+**Benefits:**
+- Much cleaner and more maintainable
+- Easy to add new routes
+- Better code splitting
+- Centralized route protection logic
 
-Only the **error-free** paths are accepted by the APIs described below.
+## Architecture Comparison
 
-### 1.3. Error responses
-
-Across the endpoints in this document, the following error patterns are relevant:
-
-- Unsupported market / hreflang:
-  - Status: `400 Bad Request`
-  - Body:  
-    ```json
-    {
-      "error": "UNSUPPORTED_MARKET",
-      "details": "UNSUPPORTED_MARKET:<rawMarket>"
-    }
-    ```
-
-Other validation and internal errors are described under each endpoint.
-
----
-
-## 2. GET `/api/metrics/technical-seo`
-
-**Purpose:** Returns static, file-backed technical SEO series data for the selected date range. Market is *validated* (if present) but not used to filter data yet.
-
-### 2.1. Query parameters
-
-| Name       | Type   | Required | Description                                                     |
-| ---------- | ------ | -------- | --------------------------------------------------------------- |
-| `date_range` | string | No       | Range label understood by `resolveRange` (e.g. `7d`, `30d`).   |
-| `network`  | string | No       | Optional filter (e.g. `"4G"`, `"3G"`).                          |
-| `browser`  | string | No       | Optional filter (e.g. `"Chrome"`, `"Safari"`).                  |
-| `device`   | string | No       | Optional filter (e.g. `"desktop"`, `"mobile"`).                 |
-| `market`   | string | No       | Hreflang or market string. Only **validated** with the mapper. |
-
-If `market` is provided, it must be one of the supported mappings (see §1.2). Unsupported values result in a 400.
-
-### 2.2. Success response (200)
-
-Body: an array of per-day entries (derived from `technical_seo.json`):
-
-```json
-[
-  {
-    "name": "2025-11-01",
-    "metadata": 10,
-    "indexing": 3,
-    "schema": 4,
-    "firebase": 1,
-    "total": 18
-  }
-]
+### Before (Old Approach)
+```
+App.jsx (hardcoded routes)
+  └─> Dashboard.jsx (routing + layout + guards)
+        └─> Individual components
 ```
 
-### 2.3. Error responses
+**Issues:**
+- Mixed concerns (routing, layout, guards in one file)
+- Duplicate protection logic
+- No code splitting
+- Hard to maintain
 
-- Unsupported market:
-  - `400`, body as described in §1.3.
-- Generic failure (e.g. JSON file missing):
-  - `500`, body: `{ "error": "TECH_SEO_FETCH_FAILED" }`
+### After (New Approach)
+```
+App.jsx (uses route configs)
+  └─> Route Guards (RequireAuth, RequireOnboarding, RequireRole)
+        └─> MainLayout (with Outlet)
+              └─> Individual components (lazy loaded)
+```
 
----
+**Benefits:**
+- Separation of concerns
+- Reusable guard components
+- Automatic code splitting
+- Easy to maintain and extend
 
-## 3. GET `/api/metrics/technical-seo/trends`
+## Route Protection Levels
 
-**Purpose:** Returns Firestore-backed, time-series technical SEO trends per category for a given brand + market + date range.
+### Level 1: Authentication (`RequireAuth`)
+- Checks if user is logged in
+- Checks email verification
 
-### 3.1. Query parameters
+### Level 2: Onboarding (`RequireOnboarding`)
+- Checks if admin needs onboarding
+- Enforces onboarding flow
 
-| Name         | Type   | Required | Description                                                                 |
-| ------------ | ------ | -------- | --------------------------------------------------------------------------- |
-| `brand`      | string | Yes      | Brand slug (e.g. `"lipton"`, `"pukkah"`).                                  |
-| `market`     | string | Yes      | Hreflang or market string; normalized using the mapper.                    |
-| `startDate`  | string | No       | Explicit start date `YYYY-MM-DD`.                                           |
-| `endDate`    | string | No       | Explicit end date `YYYY-MM-DD`.                                             |
-| `date_range` | string | No       | Label (e.g. `7d`, `30d`) used if `startDate` / `endDate` are not provided. |
+### Level 3: Role-Based (`RequireRole`)
+- Checks user role (admin/user)
+- Protects admin-only routes
 
-At least one of:
+## How to Use
 
-- `startDate` + `endDate`, or
-- `date_range`
+### Adding a New Public Route
+1. Add to `src/routes/auth.routes.jsx`
+2. Set `public: true`
+3. Component will be lazy loaded automatically
 
-must resolve to a valid date range.
+### Adding a New Dashboard Route
+1. Add to `src/routes/dashboard.routes.jsx`
+2. Specify `requiresAdmin` and/or `requiresOnboarding` if needed
+3. Add icon and label for sidebar
+4. Component will be lazy loaded automatically
 
-### 3.2. Validation & errors
+### Checking Auth State in Components
+```javascript
+import { useAuth } from '../contexts/AuthProvider'
 
-- Missing brand or market:
-  - Status `400`  
-    `{ "error": "BRAND_AND_MARKET_REQUIRED" }`
-- Unsupported market (after calling `mapHreflangToMarket`):
-  - Status `400`  
-    `{ "error": "UNSUPPORTED_MARKET", "details": "UNSUPPORTED_MARKET:<rawMarket>" }`
-- Invalid or missing date range:
-  - Status `400`  
-    `{ "error": "INVALID_DATE_RANGE" }` or `{ "error": "DATE_RANGE_ORDER_INVALID" }`
-- Generic failure:
-  - Status `500`  
-    `{ "error": "TECH_SEO_TRENDS_FETCH_FAILED" }`
-
-### 3.3. Success response (200)
-
-```json
-{
-  "brand": "lipton",
-  "market": "united-kingdom",
-  "range": { "startDate": "2025-11-01", "endDate": "2025-11-07" },
-  "dates": ["2025-11-01", "2025-11-02"],
-  "categories": [
-    {
-      "id": "indexing",
-      "name": "Indexing issues",
-      "total": 12,
-      "severityTotals": { "error": 4, "warning": 5, "info": 3 },
-      "trend": [
-        {
-          "date": "2025-11-01",
-          "count": 10,
-          "severity": { "error": 3, "warning": 4, "info": 3 }
-        },
-        {
-          "date": "2025-11-02",
-          "count": 12,
-          "severity": { "error": 4, "warning": 5, "info": 3 }
-        }
-      ]
-    }
-  ]
+function MyComponent() {
+  const { user, isAdmin, onboardingComplete, loading, profileLoading } = useAuth()
+  
+  if (loading || profileLoading) {
+    return <Spinner />
+  }
+  
+  // Use auth state...
 }
 ```
 
-`market` in the response is the normalized slug (e.g. `"en-gb"` → `"united-kingdom"`).
+## Environment Variables
 
----
+- `VITE_REQUIRE_EMAIL_VERIFICATION`: Require email verification (default: true)
+- `VITE_ENABLE_ADMIN_ONBOARDING`: Enforce admin onboarding (default: true)
 
-## 4. GET `/api/firebase/rum-metrics-p75-multiple`
+## Testing Checklist
 
-**Purpose:** Returns RUM/CRUX/diagnostics category metrics over a date range, using Firestore data; primarily used to compute P75 metrics across multiple dates.
+- [ ] Login flow works
+- [ ] Signup flow works
+- [ ] Email verification redirect works
+- [ ] Admin onboarding enforcement works (when enabled)
+- [ ] Admin-only routes are protected
+- [ ] Non-admin users cannot access admin routes
+- [ ] Sidebar shows correct items based on role
+- [ ] Code splitting is working (check Network tab)
+- [ ] Error boundary catches errors
+- [ ] All dashboard routes are accessible
 
-### 4.1. Query parameters
+## Migration Notes
 
-| Name        | Type   | Required | Description                                                            |
-| ----------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `brand`     | string | Yes      | Brand slug; defaults to `"fcl"`.                                      |
-| `market`    | string | Yes    | Hreflang or market string; defaults `"india"` but validated/normalized. |
-| `date_range`| string | Yes      | Range label for `getStartAndEndDate` (e.g. `"7d"`).                   |
-| `device`    | string | No       | Device type; normalized to `"desktop"` / `"mobile"` via `normalizeDevice`. |
+### Old Dashboard.jsx
+The old `src/pages/Dashboard.jsx` file contained:
+- Route definitions
+- Layout structure
+- Route guards
+- Admin checking logic
 
-\*If `market` is omitted, the default `"india"` is used, then normalized by the mapper.
+This has been split into:
+- `src/routes/dashboard.routes.jsx` - Route definitions
+- `src/components/layout/MainLayout.jsx` - Layout structure
+- `src/components/guards/*` - Route guards
+- `src/contexts/AuthProvider.jsx` - Admin checking logic
 
-### 4.2. Hreflang behavior
+**Action Required:** You can safely delete the old `Dashboard.jsx` file if it's no longer needed.
 
-- `const { market: resolvedMarket, error } = mapHreflangToMarket(market)`
-- On error:
-  - `400`, body: `{ "error": "UNSUPPORTED_MARKET", "details": "UNSUPPORTED_MARKET:<rawMarket>" }`
-- On success:
-  - `resolvedMarket` is passed into `getMultipleDatesCategoryMetrics`.
+### Old Protected.jsx
+The `src/components/Protected.jsx` component is now replaced by `RequireAuth.jsx`.
 
-### 4.3. Success response (200)
+**Action Required:** You can delete `Protected.jsx` once you verify everything works.
 
-The shape is whatever `getMultipleDatesCategoryMetrics` returns; typically an array of per‑date aggregated metrics, e.g.:
+## Performance Improvements
 
-```json
-[
-  {
-    "date": "2025-11-01",
-    "lcp_p75": 1800,
-    "cls_p75": 0.05,
-    "inp_p75": 120,
-    "urls": 150
-  }
-]
-```
+1. **Code Splitting**: Each route is lazy loaded, reducing initial bundle size
+2. **Centralized Auth Checks**: Admin status checked once in AuthProvider
+3. **Memoized Navigation**: Sidebar navigation is memoized based on admin status
+4. **Route-Level Guards**: Protection happens before component rendering
 
-### 4.4. Error responses
+## Future Enhancements
 
-- Unsupported market: as in §4.2.
-- Generic failure:
-  - `500`, body: `{ "error": "Internal Server Error" }`
+1. **Route-based Data Loading**: Use React Router loaders for data fetching
+2. **Route Transitions**: Add animations between route changes
+3. **Breadcrumbs**: Auto-generate breadcrumbs from route config
+4. **TypeScript**: Add type safety to route configurations
+5. **Route Metadata**: Add SEO metadata to route configs
+6. **Permission System**: Extend beyond admin/user to granular permissions
 
----
+## Documentation
 
-## 5. GET `/api/firebase/linechart-metrics`
+See `src/routes/README.md` for detailed routing documentation.
 
-**Purpose:** Returns per‑day line chart data for one of `rum`, `crux`, or `diagnostics`, using Firestore.
+## Support
 
-### 5.1. Query parameters
-
-| Name       | Type   | Required | Description                                                                 |
-| ---------- | ------ | -------- | --------------------------------------------------------------------------- |
-| `brand`    | string | Yes       | Brand slug; defaults to `"fcl"`.                                           |
-| `market`   | string | Yes     | Hreflang or market string; defaults `"india"` but normalized via mapper.   |
-| `date_range` | string | No     | Range label; used if `daterange` is absent.                                |
-| `daterange`  | string | No     | Alternate range parameter; `date_range ?? daterange` is used.             |
-| `device`   | string | No       | Device type; normalized to `"desktop"` / `"mobile"`.                      |
-| `category` | string | Yes      | One of `"rum"`, `"crux"`, `"diagnostics"` (case-insensitive).             |
-
-### 5.2. Validation & errors
-
-1. Market:
-   - `const { market: resolvedMarket, error } = mapHreflangToMarket(market)`
-   - On error → `400` with `UNSUPPORTED_MARKET` as described in §1.3.
-
-2. Category:
-   - Missing `category`:
-     - `400`  
-       `{ "error": "category query parameter is required (rum, crux, diagnostics)" }`
-   - Invalid category:
-     - `400`  
-       `{ "error": "Invalid category \"<category>\". Expected rum, crux, or diagnostics." }`
-
-3. Generic failure:
-   - `500`, `{ "error": "Internal Server Error" }`
-
-### 5.3. Success response (200)
-
-Body is the output of `fetchLinechartMetricsByCategory` for the requested category, e.g.:
-
-```json
-[
-  {
-    "date": "2025-11-01",
-    "totalUrls": 120,
-    "goodPages": 80,
-    "badPages": 40,
-    "PassPercentage": 66.67,
-    "FailPercentage": 33.33,
-    "RumMetricsGlance": {
-      "lcpPercentages": { "good": 70, "needImprovement": 20, "bad": 10 },
-      "clsPercentages": { "good": 85, "needImprovement": 10, "bad": 5 },
-      "inpPercentages": { "good": 65, "needImprovement": 25, "bad": 10 }
-    }
-  }
-]
-```
-
-The exact shape depends on the category (`RumMetricsGlance`, `CruxMetricsGlance`, or `diagnosticsMetricsGlance`).
-
----
-
-## 6. Quick Examples
-
-### 6.1. Technical SEO trends for UK (hreflang)
-
-```http
-GET /api/metrics/technical-seo/trends?brand=lipton&market=en-gb&date_range=30d
-```
-
-- Backend resolves `market` → `"united-kingdom"` and queries Firestore path:  
-  `technical_seo_trends/{brand}/{market}/daily/items` → `technical_seo_trends/lipton/united-kingdom/daily/items`.
-
-### 6.2. RUM P75 metrics for Japan (hreflang)
-
-```http
-GET /api/firebase/rum-metrics-p75-multiple?brand=pukkah&market=ja-jp&date_range=7d&device=desktop
-```
-
-- Backend resolves `market` → `"japan"` and passes that slug to the underlying Firestore model.
-
-### 6.3. Linechart diagnostics metrics for STL (special locale)
-
-```http
-GET /api/firebase/linechart-metrics?brand=lipton&market=en-us-stl&category=diagnostics&date_range=30d
-```
-
-- Backend resolves `market` → `"stl"` and fetches diagnostics metrics from the corresponding Firestore collections.
-
----
-
+If you encounter issues:
+1. Check browser console for errors
+2. Verify environment variables are set correctly
+3. Clear browser cache and restart dev server
+4. Check that all imports are correct
